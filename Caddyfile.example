@@ -1,0 +1,5 @@
+# DNS A kaydi relay.example.com -> sunucunuzun genel IP adresi
+# Caddy HTTPS/WSS sertifikasini otomatik yonetir.
+relay.example.com {
+    reverse_proxy 127.0.0.1:8765
+}
