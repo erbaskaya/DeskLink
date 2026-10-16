@@ -109,6 +109,8 @@ class PackagingTests(unittest.TestCase):
             self.assertNotIn(legacy, source)
             self.assertNotIn(legacy, (ROOT / 'desktop.py').read_text(encoding='utf-8'))
 
+    @unittest.skipIf(sys.platform == 'win32',
+                     'POSIX executable permission checks are not meaningful on Windows')
     def test_mac_scripts_are_valid_shell_and_executable(self):
         for name in ('MAC-BASLAT.command', 'MAC-TEST-SUNUCU.command',
                      'MAC-LAN-TEST-SUNUCU.command', 'MAC-APP-OLUSTUR.command', 'mac_run.sh'):
