@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 from urllib.parse import urlsplit
 
 from PIL import Image, ImageTk
@@ -21,6 +21,10 @@ from websockets.asyncio.client import connect
 
 from control import InputController
 from app_identity import APP_VERSION, DEFAULT_RELAY, bundled_brand_asset
+from device_store import (
+    get_or_create_identity, rotate_identity, get_server_url, put_server_url,
+    contacts, save_contact, delete_contact, normalize_id,
+)
 from platform_support import (
     is_macos, mac_permission_status, missing_host_permissions,
     open_mac_privacy_settings, request_screen_capture_permission,
@@ -57,17 +61,11 @@ def config_path() -> Path:
 
 
 def load_server_url() -> str:
-    try:
-        data = json.loads(config_path().read_text(encoding="utf-8"))
-        return str(data.get("server_url", DEFAULT_URL))
-    except (OSError, ValueError, TypeError):
-        return DEFAULT_URL
+    return get_server_url(DEFAULT_URL)
 
 
 def save_server_url(url: str) -> None:
-    path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"server_url": url}, ensure_ascii=False, indent=2), encoding="utf-8")
+    put_server_url(url)
 
 
 def is_trusted_lan_ip(host: str) -> bool:
@@ -104,7 +102,8 @@ def monitor_to_dict(mon) -> dict[str, int]:
 class NetworkManager:
     def __init__(self, url: str, ui_events: queue.Queue):
         self.url = url
-        self.pin = f"{secrets.randbelow(100_000_000):08d}"
+        self.device_id, self.device_key = get_or_create_identity()
+        self.device_label = "Mac bilgisayar" if is_macos() else "Windows bilgisayar" if sys.platform == "win32" else "Bilgisayar"
         self.ui_events = ui_events
         self.frames_lock = threading.Lock()
         self.last_frame: bytes | None = None
@@ -171,7 +170,8 @@ class NetworkManager:
                 async with connect(self.url, compression=None, max_size=2_100_000, max_queue=4,
                                    ping_interval=20, ping_timeout=20, proxy=None) as ws:
                     self.host_ws = ws
-                    await ws.send(json.dumps({"type": "register", "pin": self.pin}))
+                    await ws.send(json.dumps({"type": "register", "device_id": self.device_id,
+                                              "device_key": self.device_key, "name": self.device_label}))
                     async for raw in ws:
                         if isinstance(raw, bytes):
                             continue
@@ -183,8 +183,13 @@ class NetworkManager:
                         if kind == "registered":
                             self.emit("my_id", msg.get("id", ""))
                             self.emit("host_status", "Bağlı · bağlantı istekleri alınabilir")
+                        elif kind == "id_conflict":
+                            # Extremely rare (randomly generated ID already reserved).
+                            self.device_id, self.device_key = rotate_identity()
+                            await ws.send(json.dumps({"type": "register", "device_id": self.device_id,
+                                                      "device_key": self.device_key, "name": self.device_label}))
                         elif kind == "connection_request":
-                            self.emit("consent_request", msg.get("token", ""))
+                            self.emit("consent_request", msg)
                         elif kind == "request_canceled":
                             self.emit("request_canceled")
                         elif kind == "viewer_connected":
@@ -215,7 +220,7 @@ class NetworkManager:
             finally:
                 self.host_ws = None
                 await self.stop_capture()
-                self.emit("my_id", "")
+                self.emit("my_id", self.device_id)
                 self.emit("host_active", False)
             if self.running:
                 await asyncio.sleep(2.0)
@@ -281,10 +286,10 @@ class NetworkManager:
             await self.stop_capture()
             self.emit("host_active", False)
 
-    def connect_viewer(self, identifier: str, pin: str) -> None:
-        self.submit(self.viewer_loop(identifier, pin))
+    def connect_viewer(self, identifier: str) -> None:
+        self.submit(self.viewer_loop(identifier))
 
-    async def viewer_loop(self, identifier: str, pin: str) -> None:
+    async def viewer_loop(self, identifier: str) -> None:
         if self.viewer_connecting or self.viewer_ws is not None:
             return
         self.viewer_connecting = True
@@ -294,7 +299,10 @@ class NetworkManager:
             async with connect(self.url, max_size=2_100_000, max_queue=2, compression=None,
                                ping_interval=20, ping_timeout=20, proxy=None) as ws:
                 self.viewer_ws = ws
-                await ws.send(json.dumps({"type": "connect", "id": identifier, "pin": pin}))
+                # Authenticate the requesting device separately. Only its ID is shown to
+                # the host; the 256-bit device key is sent only to the relay over WSS.
+                await ws.send(json.dumps({"type": "identify", "device_id": self.device_id,
+                                          "device_key": self.device_key}))
                 async for raw in ws:
                     if isinstance(raw, bytes):
                         if self.viewer_active and len(raw) <= 2_000_000:
@@ -306,11 +314,14 @@ class NetworkManager:
                     except ValueError:
                         continue
                     kind = msg.get("type")
-                    if kind == "pending":
-                        self.emit("viewer_status", "Karşı bilgisayarın onayı bekleniyor...")
+                    if kind == "identified":
+                        await ws.send(json.dumps({"type": "connect", "id": identifier}))
+                    elif kind == "pending":
+                        self.emit("viewer_status", "Karşı bilgisayara bildirim gönderildi; onay bekleniyor...")
                     elif kind == "accepted":
                         was_connected = True
                         self.viewer_active = True
+                        self.emit("viewer_accepted", {"id": identifier, "name": msg.get("name", "")})
                         self.emit("viewer_open")
                         self.emit("viewer_status", "Uzak bağlantı aktif")
                     elif kind == "frame_meta":
@@ -499,8 +510,8 @@ class DeskLinkApp:
         self.root = tk.Tk()
         self.root.title(f"DeskLink v{APP_VERSION} — Uzak Masaüstü")
         self.set_brand_icon(self.root)
-        self.root.geometry("940x790" if is_macos() else "940x700")
-        self.root.minsize(780, 720 if is_macos() else 620)
+        self.root.geometry("940x810" if is_macos() else "940x745")
+        self.root.minsize(780, 750 if is_macos() else 700)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.events: queue.Queue = queue.Queue(maxsize=500)
@@ -510,15 +521,15 @@ class DeskLinkApp:
         if not ok:
             self.server_var.set(DEFAULT_URL)
         self.net = NetworkManager(self.server_var.get().strip(), self.events)
-        self.id_var = tk.StringVar(value="--- --- ---")
-        self.pin_var = tk.StringVar(value=self.net.pin)
+        self.id_var = tk.StringVar(value=f"{self.net.device_id[:3]} {self.net.device_id[3:6]} {self.net.device_id[6:]}")
+        self.saved_items: list[dict] = []
         self.host_status = tk.StringVar(value="Bağlantı başlatılıyor...")
-        self.viewer_status = tk.StringVar(value="Bağlanmak için ID ve erişim kodu girin.")
+        self.viewer_status = tk.StringVar(value="Kayıtlı bilgisayarı seçin veya 9 haneli ID girin.")
         self.target_id = tk.StringVar()
-        self.target_pin = tk.StringVar()
         self.is_host_active = False
         self.mac_permissions_var = tk.StringVar(value="macOS izinleri kontrol ediliyor...") if is_macos() else None
         self.setup_ui()
+        self.refresh_contacts()
         self.root.after(60, self.process_events)
 
     @staticmethod
@@ -541,17 +552,18 @@ class DeskLinkApp:
                          highlightcolor=BLUE, width=width, show=show)
         return entry
 
-    def button(self, parent, name, command, color=BLUE, fg="white"):
+    def button(self, parent, name, command, color=BLUE, fg="white", small=False):
         if is_macos():
             # Aqua ignores tk.Button background colors and may leave white text
             # on a light button. Native ttk buttons are readable in light/dark mode.
-            return ttk.Button(parent, text=name, command=command, padding=(13, 9))
+            return ttk.Button(parent, text=name, command=command, padding=(10, 5) if small else (13, 9))
         return tk.Button(parent, text=name, command=command, bg=color, fg=fg,
-                         font=(ui_font(), 11, "bold"), relief="flat", padx=16, pady=11,
+                         font=(ui_font(), 10 if small else 11, "bold"), relief="flat",
+                         padx=11 if small else 16, pady=6 if small else 11,
                          activebackground=color, activeforeground=fg, cursor="hand2")
 
     def setup_ui(self) -> None:
-        top = tk.Frame(self.root, bg=BG, padx=30, pady=22)
+        top = tk.Frame(self.root, bg=BG, padx=30, pady=10)
         top.pack(fill="x")
         try:
             self.brand_logo = tk.PhotoImage(file=str(bundled_brand_asset("DeskLink-logo-dark.png")))
@@ -563,16 +575,15 @@ class DeskLinkApp:
         self.label(top, f"Windows ve macOS arasında onaylı uzak bağlantı  ·  v{APP_VERSION}",
                    size=11).pack(anchor="w", pady=(1, 0))
 
-        server_card = tk.Frame(self.root, bg=CARD, padx=20, pady=18)
-        server_card.pack(fill="x", padx=30, pady=(0, 20))
+        server_card = tk.Frame(self.root, bg=CARD, padx=20, pady=10)
+        server_card.pack(fill="x", padx=30, pady=(0, 12))
         self.label(server_card, "BAĞLANTI SUNUCUSU", bold=True, color=TEXT).pack(anchor="w")
         row = tk.Frame(server_card, bg=CARD)
         row.pack(fill="x", pady=(9, 0))
         self.input(row, self.server_var, 46).pack(side="left", fill="x", expand=True, ipady=7)
         self.button(row, "Uygula", self.apply_url, color="#344762").pack(side="left", padx=(12, 0))
         self.label(server_card,
-                   "Cloudflare: wss://desklink-relay.erbaskayam.workers.dev/ws\n"
-                   "Aynı PC testi: ws://127.0.0.1:8765  |  Yerel ağ: ws://192.168.x.x:8765",
+                   "Cloudflare: wss://desklink-relay.erbaskayam.workers.dev/ws",
                    size=9, justify="left").pack(anchor="w", pady=(9, 0))
 
         if is_macos():
@@ -594,33 +605,48 @@ class DeskLinkApp:
         main.grid_columnconfigure(1, weight=1, uniform="sides")
         main.grid_rowconfigure(0, weight=1)
 
-        own = tk.Frame(main, bg=CARD, padx=23, pady=22)
+        own = tk.Frame(main, bg=CARD, padx=19, pady=12)
         own.grid(row=0, column=0, sticky="nsew", padx=(0, 9))
         self.label(own, "BU BİLGİSAYAR", size=12, bold=True, color=TEXT).pack(anchor="w")
-        self.label(own, "Bağlanacak kişiye yalnızca ID ve kodu iletin.", size=9).pack(anchor="w", pady=(7, 20))
+        self.label(own, "Kalıcı ID'nizi karşı tarafa iletin.", size=9).pack(anchor="w", pady=(7, 20))
         self.label(own, "Bilgisayar ID", size=10).pack(anchor="w")
         tk.Label(own, textvariable=self.id_var, font=(mono_font(), 24, "bold"), fg=TEXT, bg=CARD).pack(anchor="w", pady=(5, 12))
         self.button(own, "ID kopyala", self.copy_id, color="#344762").pack(anchor="w")
-        self.label(own, "Bu açılışa özel erişim kodu", size=10).pack(anchor="w", pady=(23, 0))
-        tk.Label(own, textvariable=self.pin_var, font=(mono_font(), 19, "bold"), fg=GREEN, bg=CARD).pack(anchor="w", pady=(3, 11))
-        self.button(own, "Kodu kopyala", self.copy_pin, color="#344762").pack(anchor="w")
+        self.label(own, "ID, program kapatılıp açıldığında değişmez.", size=10,
+                   color=GREEN).pack(anchor="w", pady=(19, 0))
+        self.label(own, "Bağlanmak isteyen kişi için bu ekranda onay bildirimi çıkar.",
+                   size=9, wraplength=325, justify="left").pack(anchor="w", pady=(15, 0))
         self.host_notice = self.label(own, "Henüz bağlantı yok.", size=10, color=GREEN)
         self.host_notice.pack(anchor="w", pady=(21, 8))
         self.stop_host_button = self.button(own, "UZAK KONTROLÜ DURDUR", self.net.disconnect_host, color=RED, fg="#151c2c")
 
-        other = tk.Frame(main, bg=CARD, padx=23, pady=22)
+        other = tk.Frame(main, bg=CARD, padx=19, pady=12)
         other.grid(row=0, column=1, sticky="nsew", padx=(9, 0))
         self.label(other, "BAŞKA BİLGİSAYARA BAĞLAN", size=12, bold=True, color=TEXT).pack(anchor="w")
-        self.label(other, "Karşı tarafta DeskLink açık olmalıdır.", size=9).pack(anchor="w", pady=(7, 25))
-        self.label(other, "Karşı bilgisayarın ID'si", size=10).pack(anchor="w")
-        self.input(other, self.target_id).pack(anchor="w", fill="x", ipady=9, pady=(8, 18))
-        self.label(other, "8 haneli erişim kodu", size=10).pack(anchor="w")
-        self.input(other, self.target_pin).pack(anchor="w", fill="x", ipady=9, pady=(8, 19))
-        self.button(other, "BAĞLANTI İSTEĞİ GÖNDER", self.start_remote).pack(fill="x")
-        self.label(other, "Bağlanacağınız kişi isteği ekranda onaylar.\nİzin verilmeden kontrol başlatılmaz.",
-                   size=9, justify="left").pack(anchor="w", pady=(20, 0))
+        self.label(other, "Karşı tarafta DeskLink açık olmalıdır.", size=9).pack(anchor="w", pady=(7, 12))
+        self.label(other, "Karşı bilgisayarın 9 haneli ID'si", size=10).pack(anchor="w")
+        self.input(other, self.target_id).pack(anchor="w", fill="x", ipady=7, pady=(7, 12))
+        self.button(other, "BAĞLAN · KARŞI TARAFA BİLDİRİM GÖNDER", self.start_remote).pack(fill="x")
+        self.label(other, "Karşı bilgisayarda onay penceresi açılır; onaysız kontrol yok.",
+                   size=9, wraplength=350, justify="left").pack(anchor="w", pady=(6, 8))
 
-        bottom = tk.Frame(self.root, bg=BG, padx=30, pady=13)
+        self.label(other, "KAYITLI BİLGİSAYARLAR", size=10, bold=True, color=TEXT).pack(anchor="w")
+        self.label(other, "Birini seçin ve Bağlan'a basın.", size=9).pack(anchor="w", pady=(3, 4))
+        list_frame = tk.Frame(other, bg=INPUT_BG, highlightthickness=1, highlightbackground="#32415d")
+        list_frame.pack(fill="both", expand=True, pady=(4, 8))
+        self.saved_list = tk.Listbox(list_frame, bg=INPUT_BG, fg=TEXT, selectbackground=BLUE,
+                                     selectforeground="white", highlightthickness=0, borderwidth=0,
+                                     font=(ui_font(), 11), exportselection=False, height=3)
+        self.saved_list.pack(fill="both", expand=True, padx=6, pady=5)
+        self.saved_list.bind("<<ListboxSelect>>", self.select_saved)
+        self.saved_list.bind("<Double-Button-1>", lambda _event: self.start_remote())
+        actions = tk.Frame(other, bg=CARD)
+        actions.pack(fill="x")
+        self.button(actions, "ID'yi kaydet", self.save_target, color="#344762", small=True).pack(side="left", padx=(0, 6))
+        self.button(actions, "Yeniden adlandır", self.rename_saved, color="#344762", small=True).pack(side="left", padx=(0, 6))
+        self.button(actions, "Sil", self.remove_saved, color="#344762", small=True).pack(side="left")
+
+        bottom = tk.Frame(self.root, bg=BG, padx=30, pady=5)
         bottom.pack(fill="x")
         tk.Label(bottom, textvariable=self.host_status, bg=BG, fg=MUTED,
                  font=(ui_font(), 10)).pack(anchor="w")
@@ -690,11 +716,6 @@ class DeskLinkApp:
             self.root.clipboard_append(value)
             self.root.update_idletasks()
 
-    def copy_pin(self) -> None:
-        self.root.clipboard_clear()
-        self.root.clipboard_append(self.pin_var.get())
-        self.root.update_idletasks()
-
     def apply_url(self) -> None:
         url = self.server_var.get().strip()
         ok, reason = validate_server_url(url)
@@ -707,18 +728,76 @@ class DeskLinkApp:
             messagebox.showerror("Ayarlar", str(exc), parent=self.root)
             return
         self.net.change_url(url)
+        self.refresh_contacts()
         self.host_status.set("Sunucu adresi değiştirildi; yeniden bağlanılıyor...")
 
+    def refresh_contacts(self, selected_id: str = "") -> None:
+        self.saved_items = contacts(self.server_var.get().strip())
+        self.saved_list.delete(0, tk.END)
+        for item in self.saved_items:
+            self.saved_list.insert(tk.END, f"{item['name']}   ·   {item['id'][:3]} {item['id'][3:6]} {item['id'][6:]}")
+        for index, item in enumerate(self.saved_items):
+            if item['id'] == selected_id:
+                self.saved_list.selection_set(index)
+                self.saved_list.see(index)
+                break
+
+    def select_saved(self, _event=None) -> None:
+        selected = self.saved_list.curselection()
+        if selected and selected[0] < len(self.saved_items):
+            self.target_id.set(self.saved_items[selected[0]]['id'])
+
+    def save_target(self) -> None:
+        identifier = normalize_id(self.target_id.get())
+        if len(identifier) != 9:
+            messagebox.showwarning("Kayıt", "Önce geçerli 9 haneli ID girin.", parent=self.root)
+            return
+        name = simpledialog.askstring("Bilgisayarı kaydet", "Bu bilgisayara bir isim verin:",
+                                      initialvalue=f"Bilgisayar {identifier}", parent=self.root)
+        if name is None:
+            return
+        try:
+            save_contact(self.server_var.get().strip(), identifier, name)
+            self.refresh_contacts(identifier)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Kayıt hatası", str(exc), parent=self.root)
+
+    def rename_saved(self) -> None:
+        selection = self.saved_list.curselection()
+        if not selection:
+            return
+        item = self.saved_items[selection[0]]
+        name = simpledialog.askstring("Bilgisayarı yeniden adlandır", "Yeni isim:",
+                                      initialvalue=item['name'], parent=self.root)
+        if name is None or not name.strip():
+            return
+        try:
+            save_contact(self.server_var.get().strip(), item['id'], name)
+            self.refresh_contacts(item['id'])
+        except OSError as exc:
+            messagebox.showerror("Kayıt hatası", str(exc), parent=self.root)
+
+    def remove_saved(self) -> None:
+        selection = self.saved_list.curselection()
+        if not selection:
+            return
+        item = self.saved_items[selection[0]]
+        if messagebox.askyesno("Kayıtlı bilgisayarı sil", f"{item['name']} kayıtlardan silinsin mi?", parent=self.root):
+            try:
+                delete_contact(self.server_var.get().strip(), item['id'])
+                self.refresh_contacts()
+            except OSError as exc:
+                messagebox.showerror("Kayıt hatası", str(exc), parent=self.root)
+
     def start_remote(self) -> None:
-        identifier = "".join(c for c in self.target_id.get() if c.isdigit())
-        pin = self.target_pin.get().strip()
-        if len(identifier) != 9 or len(pin) != 8 or not pin.isdecimal():
-            messagebox.showwarning("Bilgi eksik", "9 haneli ID ve 8 haneli erişim kodu girin.", parent=self.root)
+        identifier = normalize_id(self.target_id.get())
+        if len(identifier) != 9:
+            messagebox.showwarning("Bilgi eksik", "9 haneli bilgisayar ID'sini girin veya kayıtlı cihaz seçin.", parent=self.root)
             return
         if self.net.viewer_connecting or self.net.viewer_ws:
             messagebox.showinfo("Bağlantı", "Zaten bir bağlantı isteği var.", parent=self.root)
             return
-        self.net.connect_viewer(identifier, pin)
+        self.net.connect_viewer(identifier)
 
     def process_events(self) -> None:
         try:
@@ -734,17 +813,41 @@ class DeskLinkApp:
                 elif action == "host_active":
                     self.toggle_host(bool(value))
                 elif action == "consent_request":
-                    if not value:
+                    if not isinstance(value, dict) or not value.get('token'):
                         continue
+                    requester_id = str(value.get('requester_id') or 'Kimliği belirtilmeyen cihaz')
+                    requester_name = str(value.get('requester_name') or 'Bir bilgisayar')[:48]
+                    if self.root.state() == "iconic":
+                        self.root.deiconify()
                     self.root.lift()
+                    try:
+                        self.root.attributes('-topmost', True)
+                        self.root.bell()
+                    except tk.TclError:
+                        pass
                     allowed = messagebox.askyesno(
-                        "Uzak kontrol izni", "Bir kişi ID ve erişim kodunuzu kullanarak bağlantı istiyor.\n\n"
-                        "İzin verirseniz EKRANINIZI GÖREBİLİR ve FARE/KLAVYENİZİ KONTROL EDEBİLİR.\n\n"
-                        "Bu kişinin kimliği doğrulanmadı. Bağlantıya izin veriyor musunuz?",
+                        "DeskLink · Bağlantı isteği",
+                        f"{requester_name} ({requester_id}) bilgisayarınıza bağlanmak istiyor.\n\n"
+                        "İzin verirseniz ekranınızı görebilir ve fare/klavyenizi kontrol edebilir.\n\n"
+                        "Bu isteği yalnızca tanıyorsanız onaylayın. Bağlantıya izin verilsin mi?",
                         icon="warning", parent=self.root)
+                    try:
+                        self.root.attributes('-topmost', False)
+                    except tk.TclError:
+                        pass
                     if allowed and not self.mac_host_permissions_ok():
                         allowed = False
-                    self.net.approve(value, allowed)
+                    self.net.approve(value['token'], allowed)
+                elif action == "viewer_accepted":
+                    try:
+                        target = value['id']
+                        previous = next((item for item in contacts(self.server_var.get().strip())
+                                         if item['id'] == target), None)
+                        label = (previous or {}).get('name') or value.get('name') or f"Bilgisayar {target}"
+                        save_contact(self.server_var.get().strip(), target, label, connected=True)
+                        self.refresh_contacts(target)
+                    except (OSError, ValueError, TypeError, KeyError) as exc:
+                        self.viewer_status.set(f"Bağlandı; cihaz kaydedilemedi: {exc}")
                 elif action == "viewer_status":
                     self.viewer_status.set(str(value))
                 elif action == "viewer_error":

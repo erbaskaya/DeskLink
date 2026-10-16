@@ -30,7 +30,7 @@ export default {
     if (url.pathname === '/' && request.method === 'GET' && request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return Response.json({
         application: 'DeskLink Cloudflare Relay',
-        version: '0.3.0',
+        version: '0.5.0',
         status: 'ok',
         websocket: `wss://${url.host}/ws`,
         note: 'Bu adres masaustu DeskLink uygulamasinda kullanilir. Parola veya ID bu sayfaya yazilmaz.',

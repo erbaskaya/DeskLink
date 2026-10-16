@@ -12,7 +12,7 @@ from build_standalone import command_for_platform
 
 class StandaloneReleaseTests(unittest.TestCase):
     def test_default_cloudflare_connection_and_version(self):
-        self.assertEqual(APP_VERSION, "0.4.0")
+        self.assertEqual(APP_VERSION, "0.5.0")
         self.assertEqual(DEFAULT_RELAY, "wss://desklink-relay.erbaskayam.workers.dev/ws")
         from desktop import DEFAULT_URL, validate_server_url
         self.assertEqual(DEFAULT_URL, DEFAULT_RELAY)

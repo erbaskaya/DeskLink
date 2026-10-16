@@ -8,6 +8,7 @@ import json
 import queue
 import types
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
 from websockets.asyncio.server import serve
@@ -48,8 +49,11 @@ class ManagerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.url = "ws://127.0.0.1:" + str(self.server.sockets[0].getsockname()[1])
         self.host_queue = queue.Queue()
         self.viewer_queue = queue.Queue()
-        self.host = desktop.NetworkManager(self.url, self.host_queue)
-        self.viewer = desktop.NetworkManager(self.url, self.viewer_queue)
+        # Emulate two physical PCs with distinct stable device identities.
+        with patch.object(desktop, 'get_or_create_identity', side_effect=[
+            ('123456789', 'a' * 64), ('987654321', 'b' * 64)]):
+            self.host = desktop.NetworkManager(self.url, self.host_queue)
+            self.viewer = desktop.NetworkManager(self.url, self.viewer_queue)
 
     async def asyncTearDown(self):
         self.host.close()
@@ -73,10 +77,11 @@ class ManagerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(.13)
 
         self.host.capture_stream = types.MethodType(fake_capture, self.host)
-        self.viewer.connect_viewer(host_id, self.host.pin)
-        await event_named(self.viewer_queue, "viewer_status", predicate=lambda v: "onayı bekleniyor" in v)
-        token = await event_named(self.host_queue, "consent_request")
-        self.host.approve(token, True)
+        self.viewer.connect_viewer(host_id)
+        await event_named(self.viewer_queue, "viewer_status", predicate=lambda v: "onay bekleniyor" in v)
+        request = await event_named(self.host_queue, "consent_request")
+        self.assertEqual(request['requester_id'], '987654321')
+        self.host.approve(request['token'], True)
         await event_named(self.host_queue, "host_active", predicate=lambda b: b is True)
         await event_named(self.viewer_queue, "viewer_open")
         for _ in range(60):

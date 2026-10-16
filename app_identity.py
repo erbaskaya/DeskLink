@@ -2,7 +2,7 @@
 from pathlib import Path
 import sys
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 DEFAULT_RELAY = "wss://desklink-relay.erbaskayam.workers.dev/ws"
 
 def bundled_brand_asset(filename: str) -> Path:

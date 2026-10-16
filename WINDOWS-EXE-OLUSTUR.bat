@@ -2,10 +2,10 @@
 setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul 2>&1
 cd /d "%~dp0"
-title DeskLink v0.4.0 - Windows EXE olustur
+title DeskLink v0.5.0 - Windows EXE olustur
 
 echo =========================================================
-echo DeskLink v0.4.0 - Windows EXE derleme
+echo DeskLink v0.5.0 - Windows EXE derleme
 echo =========================================================
 echo Kurulu Python 3.11+ kontrol ediliyor...
 set "PY_EXEC="

@@ -10,6 +10,8 @@ import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass
 import hmac
+import hashlib
+import re
 import json
 import logging
 import secrets
@@ -34,6 +36,8 @@ class HostSession:
     ws: Any
     id: str
     pin: str
+    name: str = "Bilgisayar"
+    mode: str = "legacy"
     viewer: Any = None
     pending: Any = None
     pending_token: str = ""
@@ -44,7 +48,10 @@ class RelayState:
     def __init__(self) -> None:
         self.hosts: dict[str, HostSession] = {}
         self.viewer_links: dict[Any, tuple[HostSession, str]] = {}
+        self.identified: dict[Any, tuple[str, str]] = {}
+        self.device_hashes: dict[str, str] = {}  # local-test server only; resets when server restarts
         self.failures: dict[str, deque[float]] = defaultdict(deque)
+        self.request_counts: dict[str, deque[float]] = defaultdict(deque)
 
     @staticmethod
     async def send(ws: Any, msg: dict) -> None:
@@ -89,26 +96,62 @@ class RelayState:
                     continue
                 action = msg.get("type")
 
-                if action == "register" and registered is None and ws not in self.viewer_links:
-                    pin = msg.get("pin")
-                    if not isinstance(pin, str) or len(pin) != 8 or not pin.isascii() or not pin.isdecimal():
-                        await self.send(ws, {"type": "error", "message": "PIN 8 rakam olmalıdır."})
-                        continue
+                if action == "register" and registered is None and ws not in self.viewer_links and ws not in self.identified:
                     if len(self.hosts) >= 5000:
                         await self.send(ws, {"type": "error", "message": "Sunucu dolu."})
                         continue
-                    identifier = ""
-                    for _ in range(20):
-                        identifier = f"{secrets.randbelow(900_000_000) + 100_000_000:09d}"
-                        if identifier not in self.hosts:
-                            break
+                    identity, key = msg.get("device_id"), msg.get("device_key")
+                    if identity is not None or key is not None:
+                        if not isinstance(identity, str) or not re.fullmatch(r"[0-9]{9}", identity) or not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key):
+                            await self.send(ws, {"type":"error","message":"Geçersiz cihaz kimliği."})
+                            continue
+                        if identity in self.hosts:
+                            await self.send(ws, {"type":"error","message":"Bu ID başka bir aktif oturumda."})
+                            continue
+                        digest = hashlib.sha256(key.encode('ascii')).hexdigest()
+                        previous = self.device_hashes.get(identity)
+                        if previous and not hmac.compare_digest(previous, digest):
+                            await self.send(ws, {"type":"id_conflict"})
+                            continue
+                        self.device_hashes[identity] = digest
+                        name = str(msg.get('name') or 'Bilgisayar')[:48]
+                        registered = HostSession(ws=ws, id=identity, pin='', name=name, mode='persistent')
                     else:
-                        await self.send(ws, {"type": "error", "message": "Yeni ID üretilemedi."})
+                        pin = msg.get("pin")
+                        if not isinstance(pin, str) or len(pin) != 8 or not pin.isascii() or not pin.isdecimal():
+                            await self.send(ws, {"type": "error", "message": "PIN 8 rakam olmalıdır."})
+                            continue
+                        for _ in range(20):
+                            identity = f"{secrets.randbelow(900_000_000) + 100_000_000:09d}"
+                            if identity not in self.hosts and identity not in self.device_hashes:
+                                break
+                        else:
+                            await self.send(ws, {"type": "error", "message": "Yeni ID üretilemedi."})
+                            continue
+                        registered = HostSession(ws=ws, id=identity, pin=pin)
+                    self.hosts[identity] = registered
+                    await self.send(ws, {"type": "registered", "id": identity})
+                    LOGGER.info("Host connected ID=%s", identity)
+                    continue
+
+                if action == "identify" and registered is None and ws not in self.viewer_links:
+                    identity, key = msg.get('device_id'), msg.get('device_key')
+                    if self.is_blocked(ws):
+                        await self.send(ws,{"type":"error","message":"Çok fazla deneme."})
                         continue
-                    registered = HostSession(ws=ws, id=identifier, pin=pin)
-                    self.hosts[identifier] = registered
-                    await self.send(ws, {"type": "registered", "id": identifier})
-                    LOGGER.info("Host connected ID=%s", identifier)
+                    if not isinstance(identity,str) or not re.fullmatch(r'[0-9]{9}',identity) or not isinstance(key,str) or not re.fullmatch(r'[0-9a-f]{64}',key):
+                        self.failed_attempt(ws)
+                        await self.send(ws,{"type":"error","message":"Geçersiz cihaz kimliği."})
+                        continue
+                    digest = hashlib.sha256(key.encode('ascii')).hexdigest()
+                    stored = self.device_hashes.get(identity)
+                    if not stored or not hmac.compare_digest(stored, digest):
+                        self.failed_attempt(ws)
+                        await self.send(ws,{"type":"error","message":"Cihaz kimliği doğrulanamadı."})
+                        continue
+                    known = self.hosts.get(identity)
+                    self.identified[ws] = (identity,known.name if known else 'Bilgisayar')
+                    await self.send(ws,{"type":"identified","id":identity})
                     continue
 
                 if action == "connect" and registered is None and ws not in self.viewer_links:
@@ -117,27 +160,44 @@ class RelayState:
                     if self.is_blocked(ws):
                         await self.send(ws, {"type": "error", "message": "Çok fazla deneme. Daha sonra tekrar deneyin."})
                         continue
-                    if (not isinstance(host_id, str) or not isinstance(pin, str)
-                            or len(host_id) != 9 or not host_id.isascii() or not host_id.isdecimal()
-                            or len(pin) != 8 or not pin.isascii() or not pin.isdecimal()):
+                    if not isinstance(host_id, str) or not re.fullmatch(r'[0-9]{9}',host_id):
                         self.failed_attempt(ws)
-                        await self.send(ws, {"type": "error", "message": "ID veya erişim kodu hatalı."})
+                        await self.send(ws, {"type": "error", "message": "Bilgisayar ID hatalı."})
                         continue
                     host = self.hosts.get(host_id)
-                    if host is None or not hmac.compare_digest(pin, host.pin):
+                    if host is None:
                         self.failed_attempt(ws)
-                        await self.send(ws, {"type": "error", "message": "ID veya erişim kodu hatalı."})
+                        await self.send(ws,{"type":"error","message":"Bilgisayar çevrimdışı veya ID yanlış."})
+                        continue
+                    if host.mode == 'persistent' and ws not in self.identified:
+                        self.failed_attempt(ws)
+                        await self.send(ws,{"type":"error","message":"DeskLink 0.5 veya üstü gerekli."})
+                        continue
+                    if host.mode == 'legacy' and (not isinstance(pin,str) or not hmac.compare_digest(pin,host.pin)):
+                        self.failed_attempt(ws)
+                        await self.send(ws,{"type":"error","message":"ID veya erişim kodu hatalı."})
                         continue
                     if host.viewer is not None or host.pending is not None:
                         await self.send(ws, {"type": "error", "message": "Karşı bilgisayar meşgul."})
                         continue
+                    attempts = self.request_counts[self.remote_ip(ws)]
+                    now = time.monotonic()
+                    while attempts and now - attempts[0] > 600:
+                        attempts.popleft()
+                    if len(attempts) >= 20:
+                        await self.send(ws,{"type":"error","message":"Çok fazla bağlantı isteği."})
+                        continue
+                    attempts.append(now)
                     token = secrets.token_hex(12)
                     host.pending = ws
                     host.pending_token = token
                     self.viewer_links[ws] = (host, "pending")
                     await self.send(ws, {"type": "pending"})
+                    requester_id, requester_name = self.identified.get(ws, ('','Kimliği doğrulanmamış eski istemci'))
                     try:
-                        await self.send(host.ws, {"type": "connection_request", "token": token})
+                        await self.send(host.ws, {"type": "connection_request", "token": token,
+                                                  "requester_id": requester_id,
+                                                  "requester_name": requester_name})
                     except Exception:
                         await self.leave_viewer(ws)
                         continue
@@ -158,7 +218,8 @@ class RelayState:
                         registered.viewer = viewer
                         self.viewer_links[viewer] = (registered, "active")
                         try:
-                            await self.send(viewer, {"type": "accepted"})
+                            await self.send(viewer, {"type": "accepted", "id": registered.id,
+                                                     "name": registered.name})
                             await self.send(registered.ws, {"type": "viewer_connected"})
                         except Exception:
                             await self.leave_viewer(viewer)
@@ -211,6 +272,7 @@ class RelayState:
         except Exception as exc:
             LOGGER.debug("Socket terminated: %s", exc)
         finally:
+            self.identified.pop(ws, None)
             if registered:
                 if self.hosts.get(registered.id) is registered:
                     self.hosts.pop(registered.id, None)

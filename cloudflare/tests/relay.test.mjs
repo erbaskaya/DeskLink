@@ -180,3 +180,82 @@ test('valid frame metadata forwarded, malformed remote-control actions are rejec
   await hub.webSocketMessage(viewer,JSON.stringify({type:'input',kind:'key',key:'a',action:'down'}));
   assert.equal(host.last().kind,'key');
 });
+
+const KEY_A = 'a'.repeat(64);
+const KEY_B = 'b'.repeat(64);
+const KEY_C = 'c'.repeat(64);
+async function registerPersistent(hub, ws, id='123456789', key=KEY_A, name='Windows bilgisayar') {
+  await hub.webSocketMessage(ws, JSON.stringify({type:'register',device_id:id,device_key:key,name}));
+  return ws.last();
+}
+async function identify(hub, ws, id='987654321', key=KEY_B) {
+  await hub.webSocketMessage(ws, JSON.stringify({type:'identify',device_id:id,device_key:key}));
+  return ws.last();
+}
+
+test('persistent ID belongs to one device secret and reconnects with same ID',async()=>{
+  const {hub,ctx}=rig();
+  const h=add(hub,'11.0.0.1');
+  assert.deepEqual(await registerPersistent(hub,h),{type:'registered',id:'123456789'});
+  assert.equal((await ctx.storage.get('device:123456789')).hash.length,64);
+  assert.equal((await ctx.storage.get('device:123456789')).hash.includes(KEY_A),false);
+  hub.webSocketClose(h);h.readyState=3;
+  const wrong=add(hub,'22.0.0.2');
+  assert.equal((await registerPersistent(hub,wrong,'123456789',KEY_C)).type,'id_conflict');
+  const returned=add(hub,'11.0.0.3');
+  assert.deepEqual(await registerPersistent(hub,returned),{type:'registered',id:'123456789'});
+});
+
+test('ID-only connection notifies the target only after caller identity verification',async()=>{
+  const {hub}=rig();
+  const host=add(hub,'1.1.1.1');const callerHost=add(hub,'2.2.2.2');
+  const viewer=add(hub,'2.2.2.2');const anonymous=add(hub,'3.3.3.3');
+  await registerPersistent(hub,host,'123456789',KEY_A,'Mac bilgisayar');
+  await registerPersistent(hub,callerHost,'987654321',KEY_B,'Windows bilgisayar');
+  await hub.webSocketMessage(anonymous,JSON.stringify({type:'connect',id:'123456789'}));
+  assert.equal(anonymous.last().type,'error');
+  assert.equal(host.last().type,'registered');
+  const beforeIdentify=await identify(hub,viewer,'987654321',KEY_C);
+  assert.equal(beforeIdentify.type,'error');
+  assert.equal((await identify(hub,viewer)).type,'identified');
+  await hub.webSocketMessage(viewer,JSON.stringify({type:'connect',id:'123456789'}));
+  assert.equal(viewer.last().type,'pending');
+  assert.equal(host.last().type,'connection_request');
+  assert.equal(host.last().requester_id,'987654321');
+  assert.equal(host.last().requester_name,'Windows bilgisayar');
+  assert.match(host.last().token,/^[a-f0-9]{24}$/);
+  await hub.webSocketMessage(host,JSON.stringify({type:'approve',token:host.last().token,accept:true}));
+  assert.equal(viewer.last().type,'accepted');
+  assert.equal(viewer.last().name,'Mac bilgisayar');
+  assert.equal(viewer.last().id,'123456789');
+  await hub.webSocketMessage(viewer,JSON.stringify({type:'input',kind:'mouse_move',x:0.3,y:0.6}));
+  assert.equal(host.last().kind,'mouse_move');
+});
+
+test('declining a saved ID-only request never grants remote input',async()=>{
+  const {hub}=rig();const host=add(hub,'1.1.1.1');const caller=add(hub,'2.2.2.2');const viewer=add(hub,'2.2.2.3');
+  await registerPersistent(hub,host,'123456789',KEY_A);
+  await registerPersistent(hub,caller,'987654321',KEY_B);
+  await identify(hub,viewer);
+  await hub.webSocketMessage(viewer,JSON.stringify({type:'connect',id:'123456789'}));
+  const token=host.last().token;
+  await hub.webSocketMessage(viewer,JSON.stringify({type:'input',kind:'key',key:'a',action:'down'}));
+  assert.equal(host.last().type,'connection_request');
+  await hub.webSocketMessage(host,JSON.stringify({type:'approve',token,accept:false}));
+  assert.equal(viewer.last().type,'rejected');
+  assert.equal(hub.hosts.get('123456789').viewer,null);
+});
+
+test('hibernation reconstructs persistent hosts and pending requests',async()=>{
+  const {hub,ctx}=rig();const host=add(hub,'1.1.1.1');const caller=add(hub,'2.2.2.2');const viewer=add(hub,'2.2.2.3');
+  await registerPersistent(hub,host,'123456789',KEY_A);
+  await registerPersistent(hub,caller,'987654321',KEY_B);
+  await identify(hub,viewer);
+  await hub.webSocketMessage(viewer,JSON.stringify({type:'connect',id:'123456789'}));
+  const token=host.last().token;
+  const afterWake=new RelayHub(ctx);
+  assert.equal(afterWake.hosts.get('123456789').mode,'persistent');
+  await afterWake.webSocketMessage(host,JSON.stringify({type:'approve',token,accept:true}));
+  assert.equal(viewer.last().type,'accepted');
+  assert.equal(viewer.last().name,'Windows bilgisayar');
+});

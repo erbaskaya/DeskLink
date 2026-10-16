@@ -1,4 +1,4 @@
-# DeskLink v0.4.0 — Tek tıkla açılan Windows / Mac uygulaması
+# DeskLink v0.5.0 — Tek tıkla açılan Windows / Mac uygulaması
 
 > **Bu ZIP, kaynak kod + ikonlar + otomatik derleme altyapısıdır. ZIP'in içinde henüz Windows .exe veya macOS .app bulunmaz.** Onlar ayrı işletim sistemlerinde paketlenmelidir. GitHub Actions bu işi otomatik yapar.
 

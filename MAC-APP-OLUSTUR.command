@@ -2,7 +2,7 @@
 # Build .app on the Mac itself. PyInstaller cannot build a native macOS app on Windows.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-echo "DeskLink v0.4.0 - macOS .app olusturma"
+echo "DeskLink v0.5.0 - macOS .app olusturma"
 fail() {
   echo "HATA: $1"
   printf '\nPencereyi kapatmak icin Enter: '
