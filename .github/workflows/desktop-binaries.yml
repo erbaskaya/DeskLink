@@ -13,7 +13,7 @@ jobs:
     name: Windows x64 .exe
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
@@ -51,13 +51,26 @@ jobs:
             arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - name: Restore executable permissions for Mac launchers
+        shell: bash
+        run: |
+          chmod +x MAC-*.command mac_run.sh
+          ls -l MAC-*.command mac_run.sh
       - name: Install Python + Tk on builder Mac (not client Mac)
         shell: bash
         run: |
-          brew install python@3.13 python-tk@3.13
-          "$(brew --prefix python@3.13)/bin/python3.13" -m venv .build-venv
-          .build-venv/bin/python -c 'import tkinter; print("macOS Tk ready")'
+          # Some hosted Intel Macs already contain a python3.13 binary at
+          # /usr/local/bin. Homebrew may install successfully but fail to link
+          # its own symlink. Verify the Homebrew-managed interpreter directly.
+          if ! brew install python@3.13 python-tk@3.13; then
+            echo '::warning::Homebrew returned an error; checking the Python/Tk files themselves.'
+          fi
+          PYTHON_BIN="$(brew --prefix python@3.13)/bin/python3.13"
+          test -x "$PYTHON_BIN" || { echo '::error::Homebrew Python 3.13 not available'; exit 1; }
+          "$PYTHON_BIN" -c 'import tkinter; print("macOS Tk ready")'
+          "$PYTHON_BIN" -m venv .build-venv
+          .build-venv/bin/python -c 'import tkinter; print("macOS virtual environment Tk ready")'
       - name: Install build-time tools
         shell: bash
         run: |
